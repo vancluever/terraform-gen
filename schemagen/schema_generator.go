@@ -78,6 +78,21 @@ func (g *SchemaGenerator) Filename() string {
 	return g.File
 }
 
+// Run implements printer.Generator for SchemaGenerator.
+func (g *SchemaGenerator) Run(w io.Writer) error {
+	s, err := g.schemaFromStruct(g.Obj)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprint(w, "import (\n\t\"github.com/hashicorp/terraform/helper/schema\")\n\n"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "var %s = ", g.VariableName); err != nil {
+		return err
+	}
+	return g.schemaFprint(w, s, 0)
+}
+
 // schemaFromStruct generates a map[string]*schema.Schema from the supplied
 // struct.
 func (g *SchemaGenerator) schemaFromStruct(subj interface{}) (map[string]*schema.Schema, error) {
