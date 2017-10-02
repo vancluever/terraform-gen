@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/hashicorp/terraform/helper/schema"
-	"github.com/mitchellh/copystructure"
 	u "github.com/radeksimko/terraform-gen/internal/util"
 )
 
@@ -36,7 +35,7 @@ type GenState struct {
 	// element name in the schema for this field, unless manipulated in a filter.
 	CurrentName string
 
-	// The current struct being worked on.
+	// The current struct field being worked on.
 	CurrentField *reflect.StructField
 
 	// The current schema being worked on. This can be updated by a filter
@@ -45,17 +44,6 @@ type GenState struct {
 
 	// The schema action to undertake for this field.
 	Action Action
-}
-
-// Copy returns a new copy of this GenState that can be safely
-// manipulated without affecting the original.
-func (s *GenState) Copy() *GenState {
-	ns := new(GenState)
-	ns.CurrentName = s.CurrentName
-	ns.CurrentField = copystructure.Must(copystructure.Copy(s.CurrentField)).(*reflect.StructField)
-	ns.CurrentSchema = copystructure.Must(copystructure.Copy(s.CurrentSchema)).(*schema.Schema)
-
-	return ns
 }
 
 // FilterFunc is an optional filter function that can be used to transform a
@@ -108,19 +96,6 @@ func (g *SchemaGenerator) schemaFromStruct(subj interface{}) (map[string]*schema
 			}
 		}
 
-		// At this stage we should have the data we need to start making decisions
-		// about where to go from here:
-		//
-		// * If the field name or schema were wiped (empty string or nil schema),
-		// we skip almost all behaviour except for drilling down into struct
-		// fields.
-		// * If the current field was wiped, we just skip the field altogether and
-		// processing ends here.
-		//
-		// Otherwise we are good to continue down the normal path - the filter
-		// should have transformed the state, if necesasry, to allow for all
-		// necessary decisions be made to return the correct schema attribute and
-		// put it into the state.
 		if gs.Action == ActionSkip {
 			continue
 		}
