@@ -1,6 +1,7 @@
 package schemagen
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"reflect"
@@ -29,8 +30,9 @@ const (
 	ActionPromote
 )
 
-// GenState represents the state of an in-progress schema generation process.
-type GenState struct {
+// GenFieldState represents the state of an in-progress schema generation
+// process for a single field.
+type GenFieldState struct {
 	// The current parsed field name being worked on. This will be the final
 	// element name in the schema for this field, unless manipulated in a filter.
 	CurrentName string
@@ -46,11 +48,45 @@ type GenState struct {
 	Action Action
 }
 
+// genState represents the state and raw data from a (usually completed)
+// generation operation.
+type genState struct {
+	// The underlying schema.
+	Schema map[string]*schema.Schema
+
+	// Metadata for the Schema. The underlying map in the Schema field under this
+	// type is hierarchially symmetrical with the actual schema.
+	Meta *genMetaResource
+}
+
+// genMetaResource contains metadata on a specific resource field in the
+// schema hierarchy - be it a top-level resource or a nested or list element.
+// It's mainly used for storing type information that is not related to the
+// actual schema, but otherwise is symmetrical with the schema being generated.
+type genMetaResource struct {
+	// The master type for this resource.
+	Type reflect.Type
+
+	// The underlying schema metadata.
+	Schema map[string]*genMetaSchema
+}
+
+// genMetaSchema is the schema counterpart to SchemaGenMetaResource,
+// designed to represent and store metadata for schema fields versus resource
+// fields.
+type genMetaSchema struct {
+	// The field information for this schema item.
+	Field reflect.StructField
+
+	// A sub-resource, if any.
+	Elem *genMetaResource
+}
+
 // FilterFunc is an optional filter function that can be used to transform a
-// passed in GenState, allowing the ability to alter field naming, type
-// processing, or the generated schema. See GenState for more information
+// passed in GenFieldState, allowing the ability to alter field naming, type
+// processing, or the generated schema. See GenFieldState for more information
 // on the behaviour of manipulating certain fields.
-type FilterFunc func(*GenState) error
+type FilterFunc func(*GenFieldState) error
 
 // SchemaGenerator is a printer.Generator for generating schema source files.
 type SchemaGenerator struct {
@@ -80,7 +116,9 @@ func (g *SchemaGenerator) Filename() string {
 
 // Run implements printer.Generator for SchemaGenerator.
 func (g *SchemaGenerator) Run(w io.Writer) error {
-	s, err := g.schemaFromStruct(g.Obj)
+	state := new(genState)
+	var err error
+	state.Schema, state.Meta, err = g.schemaFromStruct(g.Obj)
 	if err != nil {
 		return err
 	}
@@ -90,35 +128,42 @@ func (g *SchemaGenerator) Run(w io.Writer) error {
 	if _, err := fmt.Fprintf(w, "var %s = ", g.VariableName); err != nil {
 		return err
 	}
-	return g.schemaFprint(w, s, 0)
+	return g.schemaFprint(w, state.Schema, nil)
 }
 
 // schemaFromStruct generates a map[string]*schema.Schema from the supplied
 // struct.
-func (g *SchemaGenerator) schemaFromStruct(subj interface{}) (map[string]*schema.Schema, error) {
+func (g *SchemaGenerator) schemaFromStruct(subj interface{}) (map[string]*schema.Schema, *genMetaResource, error) {
 	fields := make(map[string]*schema.Schema)
-	gs := new(GenState)
+	meta := &genMetaResource{
+		Type:   reflect.TypeOf(subj),
+		Schema: make(map[string]*genMetaSchema),
+	}
+	fs := new(GenFieldState)
 
 	rawType := u.DereferencePtrType(reflect.TypeOf(subj))
 	for i := 0; i < rawType.NumField(); i++ {
+		metaSchema := new(genMetaSchema)
+
 		f := rawType.Field(i)
-		gs.CurrentField = &f
-		gs.CurrentName = u.Underscore(gs.CurrentField.Name)
-		gs.CurrentSchema = &schema.Schema{}
+		fs.CurrentField = &f
+		fs.CurrentName = u.Underscore(fs.CurrentField.Name)
+		fs.CurrentSchema = &schema.Schema{}
 		if g.FilterFunc != nil {
-			if err := g.FilterFunc(gs); err != nil {
-				return fields, err
+			if err := g.FilterFunc(fs); err != nil {
+				return fields, meta, err
 			}
 		}
 
-		if gs.Action == ActionSkip {
+		if fs.Action == ActionSkip {
 			continue
 		}
-		t := u.DereferencePtrType(gs.CurrentField.Type)
+		metaSchema.Field = *fs.CurrentField
+		t := u.DereferencePtrType(fs.CurrentField.Type)
 		k := t.Kind()
-		if gs.CurrentSchema.Type == schema.TypeInvalid {
-			gs.CurrentSchema.Type = typeFor(k, t)
-			if gs.CurrentSchema.Type == schema.TypeInvalid {
+		if fs.CurrentSchema.Type == schema.TypeInvalid {
+			fs.CurrentSchema.Type = typeFor(k, t)
+			if fs.CurrentSchema.Type == schema.TypeInvalid {
 				// Still can't determine the field that we are looking for, skip this
 				// one. More than likely it's an interface type that requires further
 				// filtering.
@@ -126,7 +171,7 @@ func (g *SchemaGenerator) schemaFromStruct(subj interface{}) (map[string]*schema
 			}
 		}
 		// We need to perform additional actions for non-primitive types
-		switch gs.CurrentSchema.Type {
+		switch fs.CurrentSchema.Type {
 		case schema.TypeList:
 			fallthrough
 		case schema.TypeSet:
@@ -134,50 +179,58 @@ func (g *SchemaGenerator) schemaFromStruct(subj interface{}) (map[string]*schema
 			case reflect.Slice:
 				et := t.Elem().Kind()
 				if et != reflect.Struct {
-					gs.CurrentSchema.Elem = &schema.Schema{Type: typeFor(t.Elem().Kind(), t.Elem())}
+					fs.CurrentSchema.Elem = &schema.Schema{Type: typeFor(t.Elem().Kind(), t.Elem())}
 					break
 				}
 				// If we got this far, this is a set of complex resources. Logic is a
 				// simpler subset of the complex nested resource logic below, so we
 				// can't fallthrough.
 				v := reflect.New(t.Elem()).Elem().Interface()
-				e, err := g.schemaFromStruct(v)
+				e, m, err := g.schemaFromStruct(v)
 				if err != nil {
-					return fields, err
+					return fields, meta, err
 				}
-				gs.CurrentSchema.Elem = &schema.Resource{Schema: e}
+				fs.CurrentSchema.Elem = &schema.Resource{Schema: e}
+				metaSchema.Elem = m
 			case reflect.Struct:
 				// This is a complex resource! Element assignment is basically the
 				// product of recursion from here.
 				v := reflect.New(t).Elem().Interface()
-				e, err := g.schemaFromStruct(v)
+				e, m, err := g.schemaFromStruct(v)
 				if err != nil {
-					return fields, err
+					return fields, meta, err
 				}
 				// If we are promoting then we are actually merging the fields that we
 				// got from this iteration into our current field set. This allows
 				// things like embedded fields to promote themselves when they would
 				// otherwise be unnecessarily nested.
-				if gs.Action == ActionPromote {
+				if fs.Action == ActionPromote {
 					for k, v := range e {
-						if _, ok := fields[k]; ok {
-							return fields, fmt.Errorf("key %q conflicts with key already in the schema. Data: %#v", k, v)
+						_, fok := fields[k]
+						_, mok := meta.Schema[k]
+						if fok || mok {
+							// Don't necessarily differentiate here, as the two fields should
+							// always be in sync.
+							return fields, meta, fmt.Errorf("key %q conflicts with key already in the schema. Data: %#v", k, v)
 						}
 						fields[k] = v
+						meta.Schema[k] = m.Schema[k]
 					}
 					// Move on to the next field from here to avoid setting the schema twice
 					continue
 				}
-				gs.CurrentSchema.Elem = &schema.Resource{Schema: e}
-				gs.CurrentSchema.MaxItems = 1
+				fs.CurrentSchema.Elem = &schema.Resource{Schema: e}
+				fs.CurrentSchema.MaxItems = 1
+				metaSchema.Elem = m
 			}
 		}
-		if gs.CurrentName != "" {
-			fields[gs.CurrentName] = gs.CurrentSchema
+		if fs.CurrentName != "" {
+			fields[fs.CurrentName] = fs.CurrentSchema
+			meta.Schema[fs.CurrentName] = metaSchema
 		}
 	}
 	// We are done - return the schema fields.
-	return fields, nil
+	return fields, meta, nil
 }
 
 // typeFor is a helper that converts a reflect.Kind into an appropriate
@@ -217,12 +270,14 @@ func typeFor(k reflect.Kind, t reflect.Type) schema.ValueType {
 // schemaFprint dumps the passed in map[string]*schema.Schema to the passed in
 // io.Writer.
 //
-// Some level of pretty-printing (with tabbing level dictated by tl) is done
+// Some level of pretty-printing (with tabbing level dictated by tc) is done
 // just to make sure the code is syntatically correct. It should still be
 // passed through format.
-func (g *SchemaGenerator) schemaFprint(w io.Writer, s map[string]*schema.Schema, tl int) error {
-	fmt.Fprintf(w, "map[string]*schema.Schema{\n")
-	tl++
+func (g *SchemaGenerator) schemaFprint(w io.Writer, s map[string]*schema.Schema, p *u.TabPrinter) error {
+	if p == nil {
+		p = u.NewTabPrinter(0)
+	}
+	p.Fprintf(w, "map[string]*schema.Schema{\n")
 	// We need to sort our keys here because map iteration is non-deterministic,
 	// making this impossible to test by default.
 	var keys []string
@@ -232,8 +287,7 @@ func (g *SchemaGenerator) schemaFprint(w io.Writer, s map[string]*schema.Schema,
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := s[k]
-		fmt.Fprintf(w, "%s%q: {\n", strings.Repeat("\t", tl), k)
-		tl++
+		p.Fprintf(w, "%q: {\n", k)
 		srt := u.DereferencePtrType(reflect.TypeOf(v))
 		for i := 0; i < srt.NumField(); i++ {
 			rf := srt.Field(i)
@@ -263,54 +317,50 @@ func (g *SchemaGenerator) schemaFprint(w io.Writer, s map[string]*schema.Schema,
 			// validation functions and what not, they will need to be added by hand
 			// later.
 			case "Type":
-				fmt.Fprintf(w, "%sType: schema.%s,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "Type: schema.%s,\n", ri)
 			case "Optional":
-				fmt.Fprintf(w, "%sOptional: %t,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "Optional: %t,\n", ri)
 			case "Required":
-				fmt.Fprintf(w, "%sRequired: %t,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "Required: %t,\n", ri)
 			case "Computed":
-				fmt.Fprintf(w, "%sComputed: %t,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "Computed: %t,\n", ri)
 			case "ForceNew":
-				fmt.Fprintf(w, "%sForceNew: %t,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "ForceNew: %t,\n", ri)
 			case "Sensitive":
-				fmt.Fprintf(w, "%sSensitive: %t,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "Sensitive: %t,\n", ri)
 			case "Description":
-				fmt.Fprintf(w, "%sDescription: %q,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "Description: %q,\n", ri)
 			case "Deprecated":
-				fmt.Fprintf(w, "%sDeprecated: %q,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "Deprecated: %q,\n", ri)
 			case "Removed":
-				fmt.Fprintf(w, "%sRemoved: %q,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "Removed: %q,\n", ri)
 			case "MinItems":
-				fmt.Fprintf(w, "%sMinItems: %d,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "MinItems: %d,\n", ri)
 			case "MaxItems":
-				fmt.Fprintf(w, "%sMaxItems: %d,\n", strings.Repeat("\t", tl), ri)
+				p.Fprintf(w, "MaxItems: %d,\n", ri)
 			case "Default":
-				fmt.Fprintf(w, "%sDefault: %s,\n", strings.Repeat("\t", tl), valToStr(ri))
+				p.Fprintf(w, "Default: %s,\n", valToStr(ri))
 			case "InputDefault":
-				fmt.Fprintf(w, "%sInputDefault: %s,\n", strings.Repeat("\t", tl), valToStr(ri))
+				p.Fprintf(w, "InputDefault: %s,\n", valToStr(ri))
 			case "Elem":
 				switch t := ri.(type) {
 				case *schema.Schema:
-					fmt.Fprintf(w, "%sElem: &schema.Schema{Type: schema.%s},\n", strings.Repeat("\t", tl), t.Type)
+					p.Fprintf(w, "Elem: &schema.Schema{Type: schema.%s},\n", t.Type)
 				case *schema.Resource:
-					fmt.Fprintf(w, "%sElem: &schema.Resource{\n", strings.Repeat("\t", tl))
-					tl++
-					fmt.Fprintf(w, "%sSchema: ", strings.Repeat("\t", tl))
-					g.schemaFprint(w, t.Schema, tl)
-					tl--
-					fmt.Fprintf(w, "%s},\n", strings.Repeat("\t", tl))
+					p.Fprintf(w, "Elem: &schema.Resource{\n")
+					p.Fprintf(w, "Schema: ")
+					g.schemaFprint(w, t.Schema, p)
+					p.Fprintf(w, "},\n")
 				}
 			}
 		}
-		tl--
-		fmt.Fprintf(w, "%s},\n", strings.Repeat("\t", tl))
+		p.Fprintf(w, "},\n")
 	}
-	tl--
-	fmt.Fprintf(w, "%s}", strings.Repeat("\t", tl))
-	if tl > 0 {
-		fmt.Fprintf(w, ",")
+	p.Fprintf(w, "}")
+	if p.Count() > 0 {
+		p.Fprintf(w, ",")
 	}
-	fmt.Fprintf(w, "\n")
+	p.Fprintf(w, "\n")
 
 	return nil
 }
@@ -333,4 +383,113 @@ func valToStr(v interface{}) string {
 		panic("string parsed to empty string")
 	}
 	return s
+}
+
+type expandFlattenFprintType string
+
+const (
+	expandFlattenFprintTypeResourceData = expandFlattenFprintType("*schema.ResourceData")
+	expandFlattenFprintTypeMap          = expandFlattenFprintType("map[string]interface{}")
+)
+
+func (t expandFlattenFprintType) expandPrint(name string) string {
+	var f string
+	switch t {
+	case expandFlattenFprintTypeResourceData:
+		f = "d.Get(%q)"
+	case expandFlattenFprintTypeMap:
+		f = "d[%q]"
+	}
+	return fmt.Sprintf(f, name)
+}
+
+// expandFprint prints expanders for a supplied genState.
+//
+// This function is recursive - it returns a slice of *bytes.Buffer. Each
+// buffer in the slice represents the output of a single function within the
+// chain. The caller is expected to sequentially output the contents of each
+// buffer into a target io.Writer.
+func (g *SchemaGenerator) expandFprint(meta *genMetaResource, bufSlice []*bytes.Buffer) ([]*bytes.Buffer, error) {
+	p := u.NewTabPrinter(0)
+	var buf bytes.Buffer
+	bufSlice = append(bufSlice, &buf)
+	// Determine what we are dealing with here. The 1st layer is always a
+	// *schema.ResourceData, but all sub-layers (complex resources) will be
+	// map[string]interface{}.
+	var eft expandFlattenFprintType
+	if len(bufSlice) > 1 {
+		// Sub-resource
+		eft = expandFlattenFprintTypeMap
+	} else {
+		// Top level
+		eft = expandFlattenFprintTypeResourceData
+	}
+
+	rt := meta.Type
+	rs := rt.String()
+	rn := rt.Name()
+	p.Fprintf(&buf, "func expand%s(d %s) %s {\n", strings.Title(rn), eft, rs)
+
+	// Declaration literal
+	var rsp string
+	rsb := strings.TrimPrefix(rs, "*")
+	if rs != rsb {
+		rsp = "&"
+	}
+	p.Fprintf(&buf, "obj := %s%s{}\n", rsp, rsb)
+
+	// We need to sort our keys here because map iteration is non-deterministic,
+	// making this impossible to test by default.
+	var schemaKeys []string
+	for k := range meta.Schema {
+		schemaKeys = append(schemaKeys, k)
+	}
+	sort.Strings(schemaKeys)
+	for _, sk := range schemaKeys {
+		sm := meta.Schema[sk]
+		fn := sm.Field.Name
+		ft := u.DereferencePtrType(sm.Field.Type)
+		fk := ft.Kind()
+		switch fk {
+		case reflect.Slice:
+			// A slice, but we need to figure out what the element is so that we can
+			// render this properly.
+			se := ft.Elem()
+			p.Fprintf(&buf, "var s%s []%s\n", fn, se)
+			p.Fprintf(&buf, "u%s := %s.([]interface{})\n", fn, eft.expandPrint(sk))
+			p.Fprintf(&buf, "for _, v := range u%s {\n", fn)
+			if se.Kind() == reflect.Struct {
+				// Complex struct that we need to expand
+				bs, err := g.expandFprint(sm.Elem, bufSlice)
+				if err != nil {
+					return bufSlice, err
+				}
+				bufSlice = bs
+				p.Fprintf(&buf, "w = expand%s(v.(map[string]interface{}))\n", strings.Title(se.Name()))
+			} else {
+				p.Fprintf(&buf, "w := v.(%s)\n", se)
+			}
+			p.Fprintf(&buf, "s%s = append(s%[1]s, w)\n", fn)
+			p.Fprintf(&buf, "}\n")
+			p.Fprintf(&buf, "obj.%s = s%[1]s\n", fn)
+		case reflect.Struct:
+			// Complex resources
+			bs, err := g.expandFprint(sm.Elem, bufSlice)
+			if err != nil {
+				return bufSlice, err
+			}
+			bufSlice = bs
+			et := sm.Elem.Type
+			// This is hardcoded for now, as our nested complex resource handling is
+			// set to generate a single-element TypeList for complex resources.
+			p.Fprintf(&buf, "m%s := %s.([]interface{})[0].(map[string]interface{})\n", fn, eft.expandPrint(sk))
+			p.Fprintf(&buf, "obj.%s = expand%s(m%[1]s)\n", fn, strings.Title(et.Name()))
+		default:
+			p.Fprintf(&buf, "obj.%s = %s.(%s)\n", fn, eft.expandPrint(sk), fk)
+		}
+	}
+	// Close off the function
+	p.Fprintf(&buf, "return obj\n")
+	p.Fprintf(&buf, "}")
+	return bufSlice, nil
 }
