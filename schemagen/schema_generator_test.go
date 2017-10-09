@@ -15,12 +15,14 @@ type testSchemaGeneratorCase struct {
 	Subject           interface{}
 	ExpectedSchema    map[string]*schema.Schema
 	ExpectedSchemaOut string
-	// Note that ExpectedExpandOut contains package paths in type names even
-	// though said types are local to this package. This is a known issue and may
-	// not be resolveable in a sane way, and more than likely is a non-issue in
-	// production as most types will be included from a separate package.
-	ExpectedExpandOut string
-	FilterFunc        FilterFunc
+	// Note that ExpectedExpandOut and ExpectedFlattenOut contain package paths
+	// in type names even though said types are local to this package. This is a
+	// known issue and may not be resolveable in a sane way, and more than likely
+	// is a non-issue in production as most types will be included from a
+	// separate package.
+	ExpectedExpandOut  string
+	ExpectedFlattenOut string
+	FilterFunc         FilterFunc
 }
 
 func testSchemaGeneratorFilterFuncPromoteEmbedded(fs *GenFieldState) error {
@@ -71,6 +73,11 @@ type testSchemaGeneratorPrimitives struct {
 
 type testSchemaGeneratorNestedComplex struct {
 	NestedComplex testSchemaGeneratorNestedBase
+}
+
+type testSchemaGeneratorMultiFieldSameType struct {
+	FieldOne testSchemaGeneratorNestedBase
+	FieldTwo testSchemaGeneratorNestedBase
 }
 
 type testSchemaGeneratorSliceComplex struct {
@@ -137,6 +144,15 @@ func expandTestSchemaGeneratorPrimitives(d *schema.ResourceData) schemagen.testS
 	obj.IntField = d.Get("int_field").(int)
 	obj.StringField = d.Get("string_field").(string)
 	return obj
+}
+		`),
+		ExpectedFlattenOut: strings.TrimSpace(`
+func flattenTestSchemaGeneratorPrimitives(d *schema.ResourceData, obj schemagen.testSchemaGeneratorPrimitives) error {
+	d.Set("bool_field", obj.BoolField)
+	d.Set("float_field", obj.FloatField)
+	d.Set("int_field", obj.IntField)
+	d.Set("string_field", obj.StringField)
+	return nil
 }
 		`),
 	},
@@ -481,6 +497,76 @@ func expandTestSchemaGeneratorNestedBase(d map[string]interface{}) schemagen.tes
 }
 		`),
 	},
+	{
+		Name:    "multi-field, same type",
+		Subject: testSchemaGeneratorMultiFieldSameType{},
+		ExpectedSchema: map[string]*schema.Schema{
+			"field_one": {
+				Type: schema.TypeList,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"foo": {
+							Type: schema.TypeString,
+						},
+					},
+				},
+				MaxItems: 1,
+			},
+			"field_two": {
+				Type: schema.TypeList,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"foo": {
+							Type: schema.TypeString,
+						},
+					},
+				},
+				MaxItems: 1,
+			},
+		},
+		ExpectedSchemaOut: strings.TrimSpace(`
+map[string]*schema.Schema{
+	"field_one": {
+		Type: schema.TypeList,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"foo": {
+					Type: schema.TypeString,
+				},
+			},
+		},
+		MaxItems: 1,
+	},
+	"field_two": {
+		Type: schema.TypeList,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"foo": {
+					Type: schema.TypeString,
+				},
+			},
+		},
+		MaxItems: 1,
+	},
+}
+		`),
+		ExpectedExpandOut: strings.TrimSpace(`
+func expandTestSchemaGeneratorMultiFieldSameType(d *schema.ResourceData) schemagen.testSchemaGeneratorMultiFieldSameType {
+	obj := schemagen.testSchemaGeneratorMultiFieldSameType{}
+	mFieldOne := d.Get("field_one").([]interface{})[0].(map[string]interface{})
+	obj.FieldOne = expandTestSchemaGeneratorNestedBase(mFieldOne)
+	mFieldTwo := d.Get("field_two").([]interface{})[0].(map[string]interface{})
+	obj.FieldTwo = expandTestSchemaGeneratorNestedBase(mFieldTwo)
+	return obj
+}
+
+func expandTestSchemaGeneratorNestedBase(d map[string]interface{}) schemagen.testSchemaGeneratorNestedBase {
+	obj := schemagen.testSchemaGeneratorNestedBase{}
+	obj.Foo = d["foo"].(string)
+	return obj
+}
+		`),
+	},
 }
 
 func TestSchemaGeneratorSchemaFromStruct(t *testing.T) {
@@ -523,6 +609,7 @@ func TestSchemaGeneratorSchemaFprint(t *testing.T) {
 		})
 	}
 }
+
 func TestSchemaGeneratorExpandFprint(t *testing.T) {
 	for _, tc := range testSchemaGeneratorCases {
 		t.Run(tc.Name, func(t *testing.T) {
@@ -534,17 +621,44 @@ func TestSchemaGeneratorExpandFprint(t *testing.T) {
 			if err != nil {
 				t.Fatalf("bad: %s", err)
 			}
-			bufSlice, err := sg.expandFprint(m, nil)
+			fslice, err := sg.expandFprint(m, nil)
 			if err != nil {
 				t.Fatalf("bad: %s", err)
 			}
 			var funcSlice []string
-			for _, buf := range bufSlice {
-				funcSlice = append(funcSlice, buf.String())
+			for _, f := range fslice {
+				funcSlice = append(funcSlice, f.Buffer.String())
 			}
-			actual := strings.TrimSpace(strings.Join(funcSlice, "\n\n"))
+			actual := strings.TrimSpace(strings.Join(funcSlice, "\n"))
 			if tc.ExpectedExpandOut != actual {
 				t.Fatalf("\n===== Expected =====\n%s\n\n===== Actual =====\n%s\n", tc.ExpectedExpandOut, actual)
+			}
+		})
+	}
+}
+
+func TestSchemaGeneratorFlattenFprint(t *testing.T) {
+	for _, tc := range testSchemaGeneratorCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			sg := &SchemaGenerator{
+				Obj:        tc.Subject,
+				FilterFunc: tc.FilterFunc,
+			}
+			_, m, err := sg.schemaFromStruct(sg.Obj)
+			if err != nil {
+				t.Fatalf("bad: %s", err)
+			}
+			fslice, err := sg.flattenFprint(m, nil)
+			if err != nil {
+				t.Fatalf("bad: %s", err)
+			}
+			var funcSlice []string
+			for _, f := range fslice {
+				funcSlice = append(funcSlice, f.Buffer.String())
+			}
+			actual := strings.TrimSpace(strings.Join(funcSlice, "\n"))
+			if tc.ExpectedFlattenOut != actual {
+				t.Fatalf("\n===== Expected =====\n%s\n\n===== Actual =====\n%s\n", tc.ExpectedFlattenOut, actual)
 			}
 		})
 	}

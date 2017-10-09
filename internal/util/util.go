@@ -40,6 +40,50 @@ func DereferencePtrValue(v reflect.Value) reflect.Value {
 	return v
 }
 
+// TabWriter is an I/O filter that adds indentation to a stream.
+type TabPrinter struct {
+	// The underlying io.Writer that TabWriter passes the modified output off to.
+	x io.Writer
+
+	// The tab count.
+	tc int
+
+	// A flag to keep track if a outstanding line is open - that is, if there is
+	// currently a non-newline-terminated section of the stream that is being
+	// processed that has an outstanding opening brace.
+	lo bool
+	nl bool
+}
+
+// NewTabWriter creates a new TabWriter at the specified indentation level,
+// bound to the supplied io.Writer.
+func NewTabWriter(x io.Writer, tc int) *TabWriter {
+	p := &TabPrinter{x: x, tc: tc}
+	return p
+}
+
+// Write modifies the I/O stream sent to it with proper indentation, based on
+// the opening and closing braces in the content.
+func (w *TabWriter) Write(p []byte) (int, error) {
+	var buf []byte
+	var count int
+	for i, c := range p {
+		switch c {
+		case '\n':
+
+			n, err := x.Write(buf)
+			if err != nil {
+				return err
+			}
+			count+= n
+		}
+		if new && c != '\n' {
+			p = append(p[:n], append(strings.Repeat("\t", tc) + p[n:]
+		}
+	}
+}
+
+
 // TabPrinter is a simple printer that keeps track of indentation.
 type TabPrinter struct {
 	// The tab count.

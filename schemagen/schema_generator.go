@@ -403,21 +403,106 @@ func (t expandFlattenFprintType) expandPrint(name string) string {
 	return fmt.Sprintf(f, name)
 }
 
+func (t expandFlattenFprintType) flattenPrintPrimitive(name, rhs string) string {
+	var f string
+	switch t {
+	case expandFlattenFprintTypeResourceData:
+		f = "d.Set(%q, obj.%s)"
+	case expandFlattenFprintTypeMap:
+		f = "d[%q] = obj.%s"
+	}
+	return fmt.Sprintf(f, name, rhs)
+}
+
+func (t expandFlattenFprintType) flattenPrintSetSlice(sk, ft string) string {
+	var buf bytes.Buffer
+	switch t {
+	case expandFlattenFprintTypeResourceData:
+		fmt.Fprintf(&buf, "if err := d.Set(%q, s%s); err != nil {\n", sk, ft)
+		fmt.Fprintf(&buf, "return err\n")
+		fmt.Fprintf(&buf, "}\n")
+	case expandFlattenFprintTypeMap:
+		fmt.Fprintf(&buf, "d[%q] = s%s\n", sk, ft)
+	}
+	return buf.String()
+}
+
+func (t expandFlattenFprintType) flattenPrintNestedComplex(fn, ft, sk string) string {
+	var buf bytes.Buffer
+	switch t {
+	case expandFlattenFprintTypeResourceData:
+		fmt.Fprintf(&buf, "s%s := []interface{}{flatten%s(obj.%[1]s)}\n", fn, ft)
+		fmt.Fprintf(&buf, t.flattenPrintSetSlice(sk, ft))
+	case expandFlattenFprintTypeMap:
+		fmt.Fprintf(&buf, "s%s := []interface{}{flatten%s(obj.%[1]s)}\n", fn, ft)
+		fmt.Fprintf(&buf, t.flattenPrintSetSlice(sk, ft))
+	}
+	return buf.String()
+}
+
+func (t expandFlattenFprintType) flattenFuncDecl(typ string) string {
+	var f string
+	switch t {
+	case expandFlattenFprintTypeResourceData:
+		f = "(d *schema.ResourceData, obj %s) error"
+	case expandFlattenFprintTypeMap:
+		f = "(obj %s) (map[string]interface{}, error)"
+	}
+	return fmt.Sprintf(f, typ)
+}
+
+func (t expandFlattenFprintType) flattenReturnStmt() string {
+	var f string
+	switch t {
+	case expandFlattenFprintTypeResourceData:
+		f = "return nil"
+	case expandFlattenFprintTypeMap:
+		f = "return d, nil"
+	}
+	return f
+}
+
+// renderedFunc is a type representing a rendered function.
+type renderedFunc struct {
+	// The function name.
+	Name string
+
+	// A buffer containing the text of the function.
+	Buffer *bytes.Buffer
+}
+
 // expandFprint prints expanders for a supplied genState.
 //
-// This function is recursive - it returns a slice of *bytes.Buffer. Each
-// buffer in the slice represents the output of a single function within the
-// chain. The caller is expected to sequentially output the contents of each
-// buffer into a target io.Writer.
-func (g *SchemaGenerator) expandFprint(meta *genMetaResource, bufSlice []*bytes.Buffer) ([]*bytes.Buffer, error) {
+// This function is recursive - it returns a slice of rendered functions, each
+// of which should be a unique function. The caller is expected to sequentially
+// output the contents of each function's buffer into a target io.Writer.
+func (g *SchemaGenerator) expandFprint(meta *genMetaResource, fslice []renderedFunc) ([]renderedFunc, error) {
 	p := u.NewTabPrinter(0)
+	rt := meta.Type
+	rs := rt.String()
+	rn := rt.Name()
+	fname := fmt.Sprintf("expand%s", strings.Title(rn))
+	// Check the current function list as passed in for the function we are
+	// rendering. If it exists, we skip this function as we have rendered it
+	// already.
+	for _, v := range fslice {
+		if v.Name == fname {
+			return fslice, nil
+		}
+	}
+
 	var buf bytes.Buffer
-	bufSlice = append(bufSlice, &buf)
+	fstruct := renderedFunc{
+		Name:   fname,
+		Buffer: &buf,
+	}
+	fslice = append(fslice, fstruct)
+
 	// Determine what we are dealing with here. The 1st layer is always a
 	// *schema.ResourceData, but all sub-layers (complex resources) will be
 	// map[string]interface{}.
 	var eft expandFlattenFprintType
-	if len(bufSlice) > 1 {
+	if len(fslice) > 1 {
 		// Sub-resource
 		eft = expandFlattenFprintTypeMap
 	} else {
@@ -425,10 +510,7 @@ func (g *SchemaGenerator) expandFprint(meta *genMetaResource, bufSlice []*bytes.
 		eft = expandFlattenFprintTypeResourceData
 	}
 
-	rt := meta.Type
-	rs := rt.String()
-	rn := rt.Name()
-	p.Fprintf(&buf, "func expand%s(d %s) %s {\n", strings.Title(rn), eft, rs)
+	p.Fprintf(&buf, "func %s(d %s) %s {\n", fname, eft, rs)
 
 	// Declaration literal
 	var rsp string
@@ -460,11 +542,11 @@ func (g *SchemaGenerator) expandFprint(meta *genMetaResource, bufSlice []*bytes.
 			p.Fprintf(&buf, "for _, v := range u%s {\n", fn)
 			if se.Kind() == reflect.Struct {
 				// Complex struct that we need to expand
-				bs, err := g.expandFprint(sm.Elem, bufSlice)
+				fs, err := g.expandFprint(sm.Elem, fslice)
 				if err != nil {
-					return bufSlice, err
+					return fslice, err
 				}
-				bufSlice = bs
+				fslice = fs
 				p.Fprintf(&buf, "w = expand%s(v.(map[string]interface{}))\n", strings.Title(se.Name()))
 			} else {
 				p.Fprintf(&buf, "w := v.(%s)\n", se)
@@ -474,11 +556,11 @@ func (g *SchemaGenerator) expandFprint(meta *genMetaResource, bufSlice []*bytes.
 			p.Fprintf(&buf, "obj.%s = s%[1]s\n", fn)
 		case reflect.Struct:
 			// Complex resources
-			bs, err := g.expandFprint(sm.Elem, bufSlice)
+			fs, err := g.expandFprint(sm.Elem, fslice)
 			if err != nil {
-				return bufSlice, err
+				return fslice, err
 			}
-			bufSlice = bs
+			fslice = fs
 			et := sm.Elem.Type
 			// This is hardcoded for now, as our nested complex resource handling is
 			// set to generate a single-element TypeList for complex resources.
@@ -490,6 +572,98 @@ func (g *SchemaGenerator) expandFprint(meta *genMetaResource, bufSlice []*bytes.
 	}
 	// Close off the function
 	p.Fprintf(&buf, "return obj\n")
-	p.Fprintf(&buf, "}")
-	return bufSlice, nil
+	p.Fprintf(&buf, "}\n")
+	return fslice, nil
+}
+
+// flattenFprint prints flatteners for a supplied genState.
+//
+// This function is recursive - it returns a slice of rendered functions, each
+// of which should be a unique function. The caller is expected to sequentially
+// output the contents of each function's buffer into a target io.Writer.
+func (g *SchemaGenerator) flattenFprint(meta *genMetaResource, fslice []renderedFunc) ([]renderedFunc, error) {
+	p := u.NewTabPrinter(0)
+	rt := meta.Type
+	rs := rt.String()
+	rn := rt.Name()
+	fname := fmt.Sprintf("flatten%s", strings.Title(rn))
+	// Check the current function list as passed in for the function we are
+	// rendering. If it exists, we skip this function as we have rendered it
+	// already.
+	for _, v := range fslice {
+		if v.Name == fname {
+			return fslice, nil
+		}
+	}
+
+	var buf bytes.Buffer
+	fstruct := renderedFunc{
+		Name:   fname,
+		Buffer: &buf,
+	}
+	fslice = append(fslice, fstruct)
+
+	// Determine what we are dealing with here. The 1st layer is always a
+	// *schema.ResourceData, but all sub-layers (complex resources) will be
+	// map[string]interface{}.
+	var eft expandFlattenFprintType
+	if len(fslice) > 1 {
+		// Sub-resource
+		eft = expandFlattenFprintTypeMap
+	} else {
+		// Top level
+		eft = expandFlattenFprintTypeResourceData
+	}
+
+	p.Fprintf(&buf, "func %s%s {\n", fname, eft.flattenFuncDecl(rs))
+
+	// We need to sort our keys here because map iteration is non-deterministic,
+	// making this impossible to test by default.
+	var schemaKeys []string
+	for k := range meta.Schema {
+		schemaKeys = append(schemaKeys, k)
+	}
+	sort.Strings(schemaKeys)
+	for _, sk := range schemaKeys {
+		sm := meta.Schema[sk]
+		fn := sm.Field.Name
+		ft := u.DereferencePtrType(sm.Field.Type)
+		fk := ft.Kind()
+		switch fk {
+		case reflect.Slice:
+			// A slice, but we need to figure out what the element is so that we can
+			// render this properly.
+			se := ft.Elem()
+			p.Fprintf(&buf, "var s%s []interface{}\n", fn)
+			p.Fprintf(&buf, "for _, v := range obj.%s\n", fn)
+			if se.Kind() == reflect.Struct {
+				// Complex struct that we need to expand
+				fs, err := g.expandFprint(sm.Elem, fslice)
+				if err != nil {
+					return fslice, err
+				}
+				fslice = fs
+				p.Fprintf(&buf, "s%s = append(s%[1]s, flatten%s(v))\n", fn, strings.Title(se.Name()))
+			} else {
+				p.Fprintf(&buf, "s%s = append(v)\n", fn)
+			}
+			p.Fprintf(&buf, "}\n")
+			p.Fprintf(&buf, eft.flattenPrintSetSlice(sk, se.Name()))
+		case reflect.Struct:
+			// Complex resources
+			fs, err := g.flattenFprint(sm.Elem, fslice)
+			if err != nil {
+				return fslice, err
+			}
+			fslice = fs
+			et := sm.Elem.Type
+			p.Fprintf(&buf, eft.flattenPrintNestedComplex(fn, et.Name(), sk))
+		default:
+			p.Fprintf(&buf, "%s\n", eft.flattenPrintPrimitive(sk, fn))
+		}
+	}
+	// Close off the function
+	p.Fprintf(&buf, "%s\n", eft.flattenReturnStmt())
+	p.Fprintf(&buf, "}\n")
+	return fslice, nil
 }
